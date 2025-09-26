@@ -2,45 +2,48 @@ import os
 import pandas as pd
 from decimal import Decimal
 from django.core.management.base import BaseCommand
-from loans.models import Customer
-
+from loans.tasks import load_customers_task
 
 class Command(BaseCommand):
-    help = "Load customers from Excel into the database"
+    help = "Load customers from Excel into the database using background tasks"
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--file',
+            type=str,
+            default='data/customer_data.xlsx',
+            help='Path to the Excel file containing customer data'
+        )
+        parser.add_argument(
+            '--sync',
+            action='store_true',
+            help='Run synchronously instead of as background task'
+        )
 
     def handle(self, *args, **kwargs):
-        # Path to Excel file
-        excel_path = os.path.join("data", "customers.xlsx")
-
-        if not os.path.exists(excel_path):
-            self.stdout.write(self.style.ERROR(f"Excel file not found: {excel_path}"))
-            return
-
-        df = pd.read_excel(excel_path)
-
-        created_count = 0
-        skipped_count = 0
-
-        for _, row in df.iterrows():
-            phone_number = int(row["Phone Number"])
-
-            if Customer.objects.filter(phone_number=phone_number).exists():
-                skipped_count += 1
-                continue
-
-            customer = Customer(
-                first_name=row["First Name"],
-                last_name=row["Last Name"],
-                age=int(row["Age"]),
-                phone_number=phone_number,
-                monthly_salary=Decimal(str(row["Monthly Salary"])),
-                current_debt=Decimal(str(row.get("current_debt", 0))),
+        file_path = kwargs['file']
+        sync = kwargs['sync']
+        
+        if sync:
+            # Run synchronously for development/testing
+            result = load_customers_task(file_path)
+            if result['status'] == 'success':
+                self.stdout.write(
+                    self.style.SUCCESS(
+                        f"✅ Loaded {result['created']} customers, "
+                        f"skipped {result['skipped']} (already exist), "
+                        f"errors: {result['errors']}"
+                    )
+                )
+            else:
+                self.stdout.write(
+                    self.style.ERROR(f"Failed to load customers: {result['message']}")
+                )
+        else:
+            # Run as background task
+            task = load_customers_task.delay(file_path)
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"✅ Customer loading task started with ID: {task.id}"
+                )
             )
-            customer.save()
-            created_count += 1
-
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"✅ Loaded {created_count} customers, skipped {skipped_count} (already exist)."
-            )
-        )

@@ -1,12 +1,30 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
-from .serializers import CustomerRegisterSerializer,LoanEligibilityRequestSerializer, LoanEligibilityResponseSerializer,LoanViewSerializer
+from decimal import Decimal
+from datetime import date, timedelta
+from django.utils import timezone
+from loans.models import Customer, Loan, LoanApplication, CreditScore
+from .serializers import (
+    CustomerRegisterSerializer, 
+    LoanEligibilityRequestSerializer, 
+    LoanEligibilityResponseSerializer,
+    LoanViewSerializer,
+    CreateLoanRequestSerializer,
+    CreateLoanResponseSerializer
+)
 from .services.eligibility_service import evaluate_loan
-from .models import Customer
+from .tasks import load_customers_task, load_loans_task
+import logging
+
+logger = logging.getLogger(__name__)
 
 @api_view(['POST'])
-def customer_register(request):
+def register(request):
+    """
+    API endpoint to register a new customer
+    Expected response format as per assignment
+    """
     serializer = CustomerRegisterSerializer(data=request.data)
     if serializer.is_valid():
         customer = serializer.save()
@@ -14,17 +32,20 @@ def customer_register(request):
             "customer_id": customer.customer_id,
             "name": customer.get_full_name(),
             "age": customer.age,
-            "monthly_income": customer.monthly_salary,
-            "approved_limit": customer.approved_limit,
-            "phone_number": customer.phone_number
+            "monthly_income": float(customer.monthly_salary),
+            "approved_limit": float(customer.approved_limit),
+            "phone_number": str(customer.phone_number)
         }
         return Response(response_data, status=status.HTTP_201_CREATED)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-
 @api_view(["POST"])
 def check_eligibility(request):
+    """
+    API endpoint to check loan eligibility
+    Expected response format as per assignment
+    """
     serializer = LoanEligibilityRequestSerializer(data=request.data)
     if serializer.is_valid():
         data = serializer.validated_data
@@ -36,32 +57,22 @@ def check_eligibility(request):
         approved, credit_score, interest_rate, corrected_rate, emi = evaluate_loan(
             customer,
             data['loan_amount'],
-            data['interest_rate'],
+            data['interest_rate'], 
             data['tenure']
         )
 
         response_data = {
             "customer_id": customer.customer_id,
-    "approval": approved,
-    "interest_rate": float(interest_rate),
-    "corrected_interest_rate": float(corrected_rate) if corrected_rate else float(interest_rate),
-    "tenure": data['tenure'],
-    "monthly_installment": float(emi),
+            "approval": approved,
+            "interest_rate": float(interest_rate),
+            "corrected_interest_rate": float(corrected_rate) if corrected_rate else float(interest_rate),
+            "tenure": data['tenure'],
+            "monthly_installment": float(emi),
         }
-
-        response_serializer = LoanEligibilityResponseSerializer(response_data)
-        return Response(response_serializer.data, status=status.HTTP_200_OK)
-
+        
+        return Response(response_data, status=status.HTTP_200_OK)
+    
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
-from rest_framework import status
-from decimal import Decimal
-from datetime import date, timedelta
-
-from loans.models import Customer, Loan, LoanApplication, CreditScore
-
 
 def evaluate_loan_eligibility(customer, loan_amount, interest_rate, tenure):
     """
@@ -78,7 +89,7 @@ def evaluate_loan_eligibility(customer, loan_amount, interest_rate, tenure):
     principal = float(loan_amount)
     r = float(interest_rate) / (12 * 100)
     n = tenure
-
+    
     if r == 0:
         emi = principal / n
     else:
@@ -98,29 +109,30 @@ def evaluate_loan_eligibility(customer, loan_amount, interest_rate, tenure):
 
     return True, "Loan approved", Decimal(str(round(emi, 2))), credit_score
 
-
 @api_view(["POST"])
 def create_loan(request):
     """
     Endpoint: /create-loan
-    Processes a new loan based on eligibility
+    Expected response format as per assignment
     """
-    data = request.data
-    required_fields = ["customer_id", "loan_amount", "interest_rate", "tenure"]
-    for field in required_fields:
-        if field not in data:
-            return Response({"error": f"{field} is required"}, status=status.HTTP_400_BAD_REQUEST)
-
+    serializer = CreateLoanRequestSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    data = serializer.validated_data
+    
     try:
         customer = Customer.objects.get(customer_id=data["customer_id"])
     except Customer.DoesNotExist:
         return Response({"error": "Customer not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    loan_amount = Decimal(str(data["loan_amount"]))
-    interest_rate = Decimal(str(data["interest_rate"]))
-    tenure = int(data["tenure"])
+    loan_amount = data["loan_amount"]
+    interest_rate = data["interest_rate"]
+    tenure = data["tenure"]
 
-    approved, message, emi, credit_score = evaluate_loan_eligibility(customer, loan_amount, interest_rate, tenure)
+    approved, message, emi, credit_score = evaluate_loan_eligibility(
+        customer, loan_amount, interest_rate, tenure
+    )
 
     # Create LoanApplication
     application = LoanApplication.objects.create(
@@ -131,13 +143,15 @@ def create_loan(request):
         status='APPROVED' if approved else 'REJECTED',
         monthly_installment=emi,
         credit_score_at_application=credit_score,
-        rejection_message=None if approved else message
+        rejection_message=None if approved else message,
+        processed_at=timezone.now()
     )
 
     loan_id = None
     if approved:
         start_date = date.today()
         end_date = start_date + timedelta(days=30 * tenure)
+        
         loan = Loan.objects.create(
             customer=customer,
             loan_amount=loan_amount,
@@ -147,12 +161,15 @@ def create_loan(request):
             end_date=end_date,
             monthly_repayment=emi
         )
+        
         application.loan = loan
         application.approved_amount = loan_amount
         application.approved_interest_rate = interest_rate
         application.save()
+        
         loan_id = loan.loan_id
 
+    # Response format as per assignment specification
     response_data = {
         "loan_id": loan_id,
         "customer_id": customer.customer_id,
@@ -160,14 +177,16 @@ def create_loan(request):
         "message": message,
         "monthly_installment": float(emi)
     }
-
-    return Response(response_data, status=status.HTTP_200_OK if approved else status.HTTP_400_BAD_REQUEST)
-
-
-
+    
+    response_serializer = CreateLoanResponseSerializer(response_data)
+    return Response(response_serializer.data, status=status.HTTP_200_OK)
 
 @api_view(["GET"])
 def view_loan(request, loan_id):
+    """
+    API endpoint to view a specific loan
+    Expected response format as per assignment
+    """
     try:
         loan = Loan.objects.get(loan_id=loan_id)
     except Loan.DoesNotExist:
@@ -175,10 +194,8 @@ def view_loan(request, loan_id):
 
     # Check if the loan has an approved application
     loan_approved = False
-    interest_rate = float(loan.interest_rate)
     if hasattr(loan, 'application') and loan.application.status == "APPROVED":
         loan_approved = True
-        interest_rate = float(loan.application.approved_interest_rate or loan.interest_rate)
 
     response_data = {
         "loan_id": loan.loan_id,
@@ -186,21 +203,24 @@ def view_loan(request, loan_id):
             "customer_id": loan.customer.customer_id,
             "first_name": loan.customer.first_name,
             "last_name": loan.customer.last_name,
-            "phone_number": loan.customer.phone_number,
+            "phone_number": str(loan.customer.phone_number),
             "age": loan.customer.age
         },
         "loan_amount": float(loan.loan_amount),
-        "interest_rate": interest_rate,
+        "interest_rate": float(loan.interest_rate),
         "loan_approved": loan_approved,
         "monthly_installment": float(loan.monthly_repayment),
         "tenure": loan.tenure
     }
-
+    
     return Response(response_data, status=status.HTTP_200_OK)
 
-
 @api_view(["GET"])
-def view_loans_by_customer(request, customer_id):
+def view_loans(request, customer_id):
+    """
+    API endpoint to view all loans for a customer
+    Expected response format as per assignment
+    """
     try:
         customer = Customer.objects.get(customer_id=customer_id)
     except Customer.DoesNotExist:
@@ -208,15 +228,82 @@ def view_loans_by_customer(request, customer_id):
 
     loans = customer.loans.all()  # Related name from Loan model: loans
     response_data = []
-
+    
     for loan in loans:
+        loan_approved = False
+        if hasattr(loan, 'application') and loan.application.status == "APPROVED":
+            loan_approved = True
+            
         response_data.append({
             "loan_id": loan.loan_id,
             "loan_amount": float(loan.loan_amount),
-            "loan_approved": True if hasattr(loan, 'application') and loan.application.status == "APPROVED" else False,
+            "loan_approved": loan_approved,
             "interest_rate": float(loan.interest_rate),
             "monthly_installment": float(loan.monthly_repayment),
             "repayments_left": loan.repayments_left
         })
+    
+    return Response(response_data, status=status.HTTP_200_OK)
 
+# Background task endpoints
+@api_view(['POST'])
+def ingest_customer_data(request):
+    """
+    API endpoint to trigger customer data ingestion as background task
+    """
+    file_path = request.data.get('file_path', 'data/customer_data.xlsx')
+    
+    try:
+        task = load_customers_task.delay(file_path)
+        return Response({
+            'task_id': task.id,
+            'status': 'Task started',
+            'message': 'Customer data ingestion started in background'
+        }, status=status.HTTP_202_ACCEPTED)
+    except Exception as e:
+        logger.error(f"Failed to start customer ingestion task: {str(e)}")
+        return Response({
+            'error': 'Failed to start background task',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['POST'])
+def ingest_loan_data(request):
+    """
+    API endpoint to trigger loan data ingestion as background task
+    """
+    file_path = request.data.get('file_path', 'data/loan_data.xlsx')
+    
+    try:
+        task = load_loans_task.delay(file_path)
+        return Response({
+            'task_id': task.id,
+            'status': 'Task started',
+            'message': 'Loan data ingestion started in background'
+        }, status=status.HTTP_202_ACCEPTED)
+    except Exception as e:
+        logger.error(f"Failed to start loan ingestion task: {str(e)}")
+        return Response({
+            'error': 'Failed to start background task',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def task_status(request, task_id):
+    """
+    API endpoint to check background task status
+    """
+    from celery.result import AsyncResult
+    
+    task_result = AsyncResult(task_id)
+    
+    response_data = {
+        'task_id': task_id,
+        'status': task_result.status,
+        'result': task_result.result
+    }
+    
+    if task_result.status == 'PROGRESS':
+        response_data['progress'] = task_result.info
+    
     return Response(response_data, status=status.HTTP_200_OK)
