@@ -94,4 +94,18 @@ class LoanViewSerializer(serializers.ModelSerializer):
         if hasattr(obj, 'application') and obj.application.status == 'APPROVED':
             return True
         return False
+    
+
+class CreateLoanRequestSerializer(serializers.Serializer):
+    customer_id = serializers.IntegerField()
+    loan_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    interest_rate = serializers.DecimalField(max_digits=5, decimal_places=2)
+    tenure = serializers.IntegerField()
+
+class CreateLoanResponseSerializer(serializers.Serializer):
+    loan_id = serializers.IntegerField(allow_null=True)
+    customer_id = serializers.IntegerField()
+    loan_approved = serializers.BooleanField()
+    message = serializers.CharField()
+    monthly_installment = serializers.DecimalField(max_digits=12, decimal_places=2)
 
